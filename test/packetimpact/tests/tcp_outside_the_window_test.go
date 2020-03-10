@@ -15,6 +15,7 @@
 package tcp_outside_the_window_test
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -26,22 +27,54 @@ import (
 )
 
 func TestTCPOutsideTheWindow(t *testing.T) {
-	dut := tb.NewDUT(t)
-	defer dut.TearDown()
-	listenFd, remotePort := dut.CreateListener(unix.SOCK_STREAM, unix.IPPROTO_TCP, 1)
-	defer dut.Close(listenFd)
-	conn := tb.NewTCPIPv4(t, dut, tb.TCP{DstPort: &remotePort}, tb.TCP{SrcPort: &remotePort})
-	defer conn.Close()
-	conn.Handshake()
-	acceptFd, _ := dut.Accept(listenFd)
-	defer dut.Close(acceptFd)
+	for _, tt := range []struct {
+		description  string
+		tcpFlags     uint8
+		payload      []tb.Layer
+		seqNumOffset seqnum.Size
+		expectAck    bool
+	}{
+		{"SYN", header.TCPFlagSyn, nil, 0, true},
+		{"SYNACK", header.TCPFlagSyn | header.TCPFlagAck, nil, 0, true},
+		{"ACK", header.TCPFlagAck, nil, 0, false},
+		{"FIN", header.TCPFlagFin, nil, 0, false},
+		{"Data", header.TCPFlagAck, []tb.Layer{&tb.Payload{Bytes: []byte("abc123")}}, 0, true},
 
-	windowSize := seqnum.Size(*conn.SynAck.WindowSize) + 2
-	conn.Send(tb.TCP{
-		Flags:  tb.Uint8(header.TCPFlagAck),
-		SeqNum: tb.Uint32(uint32(conn.LocalSeqNum.Add(windowSize))),
-	})
-	if gotAck := conn.Expect(tb.TCP{Flags: tb.Uint8(header.TCPFlagAck)}, 10*time.Second); gotAck == nil {
-		t.Fatal("expected an ACK packet within ten second but got none")
+		{"SYN", header.TCPFlagSyn, nil, 1, true},
+		{"SYNACK", header.TCPFlagSyn | header.TCPFlagAck, nil, 1, true},
+		{"ACK", header.TCPFlagAck, nil, 1, true},
+		{"FIN", header.TCPFlagFin, nil, 1, false},
+		{"Data", header.TCPFlagAck, []tb.Layer{&tb.Payload{Bytes: []byte("abc123")}}, 1, true},
+
+		{"SYN", header.TCPFlagSyn, nil, 2, true},
+		{"SYNACK", header.TCPFlagSyn | header.TCPFlagAck, nil, 2, true},
+		{"ACK", header.TCPFlagAck, nil, 2, true},
+		{"FIN", header.TCPFlagFin, nil, 2, false},
+		{"Data", header.TCPFlagAck, []tb.Layer{&tb.Payload{Bytes: []byte("abc123")}}, 2, true},
+	} {
+		t.Run(fmt.Sprintf("%s%d", tt.description, tt.seqNumOffset), func(t *testing.T) {
+			dut := tb.NewDUT(t)
+			defer dut.TearDown()
+			listenFd, remotePort := dut.CreateListener(unix.SOCK_STREAM, unix.IPPROTO_TCP, 1)
+			defer dut.Close(listenFd)
+			conn := tb.NewTCPIPv4(t, dut, tb.TCP{DstPort: &remotePort}, tb.TCP{SrcPort: &remotePort})
+			defer conn.Close()
+			conn.Handshake()
+			acceptFd, _ := dut.Accept(listenFd)
+			defer dut.Close(acceptFd)
+
+			windowSize := seqnum.Size(*conn.SynAck.WindowSize) + tt.seqNumOffset
+			conn.Send(tb.TCP{
+				Flags:  tb.Uint8(tt.tcpFlags),
+				SeqNum: tb.Uint32(uint32(conn.LocalSeqNum.Add(windowSize))),
+			}, tt.payload...)
+			gotAck := conn.Expect(tb.TCP{Flags: tb.Uint8(header.TCPFlagAck)}, 3*time.Second)
+			if tt.expectAck && gotAck == nil {
+				t.Fatal("expected an ACK packet within 3 seconds but got none")
+			}
+			if !tt.expectAck && gotAck != nil {
+				t.Fatal("expected no ACK packet within 3 seconds but got one")
+			}
+		})
 	}
 }
